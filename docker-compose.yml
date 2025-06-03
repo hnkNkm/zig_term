@@ -1,0 +1,51 @@
+services:
+  zterm-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev-env
+    container_name: zterm-development
+    volumes:
+      - .:/workspace
+      - zig-cache:/workspace/.zig-cache
+      - zig-out:/workspace/zig-out
+      - ~/.gitconfig:/root/.gitconfig:ro
+    ports:
+      - "3000:3000" # デバッグサーバー用
+    stdin_open: true
+    tty: true
+    environment:
+      - ZIG_GLOBAL_CACHE_DIR=/workspace/.zig-cache
+      - TERM=xterm-256color
+    working_dir: /workspace
+    command: /bin/bash
+
+  zterm-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: zterm-builder
+    volumes:
+      - .:/workspace
+      - zig-cache:/workspace/.zig-cache
+      - zig-out:/workspace/zig-out
+    environment:
+      - ZIG_GLOBAL_CACHE_DIR=/workspace/.zig-cache
+
+  zterm-runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: zterm-runtime
+    stdin_open: true
+    tty: true
+    environment:
+      - TERM=xterm-256color
+
+volumes:
+  zig-cache:
+    driver: local
+  zig-out:
+    driver: local

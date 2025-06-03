@@ -1,0 +1,36 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.exe
+
+# Log files
+*.log
+
+# Docker volumes
+docker-data/
+
+# Temporary files
+tmp/
+temp/ 
