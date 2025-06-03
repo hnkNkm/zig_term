@@ -21,6 +21,18 @@ pub fn main() !void {
     _ = c.initscr();
     defer _ = c.endwin();
 
+    // カラー設定の初期化（Gitブランチ表示用）
+    if (c.has_colors()) {
+        _ = c.start_color();
+        // デフォルトカラーの使用を有効化
+        _ = c.use_default_colors();
+        // ブランチ名表示用のカラーペア（緑色）
+        _ = c.init_pair(1, c.COLOR_GREEN, -1);
+        // テスト用の追加カラーペア
+        _ = c.init_pair(2, c.COLOR_RED, -1);
+        _ = c.init_pair(3, c.COLOR_BLUE, -1);
+    }
+
     // カーソルを非表示に
     _ = c.curs_set(0);
 
@@ -41,14 +53,14 @@ pub fn main() !void {
 
 fn runMainLoop(terminal: *Terminal) !void {
     var running = true;
-    
+
     while (running) {
         // 画面の描画
         try terminal.draw();
-        
+
         // キー入力の処理
         const key = c.getch();
-        
+
         switch (key) {
             // Ctrl+C で終了
             3 => running = false,
@@ -87,4 +99,4 @@ test "basic terminal functionality" {
     // 基本的な機能のテスト
     try testing.expect(terminal.cursor_x == 0);
     try testing.expect(terminal.cursor_y == 0);
-} 
+}
