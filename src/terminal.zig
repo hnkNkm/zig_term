@@ -142,13 +142,19 @@ pub const Terminal = struct {
             try self.command_history.append(cmd_copy);
             self.history_index = self.command_history.items.len;
 
-            // 現在の行（プロンプト付き）を履歴に追加
-            var full_line = ArrayList(u8).init(self.allocator);
-            const prompt = try self.getPromptForHistory();
-            defer self.allocator.free(prompt);
-            try full_line.appendSlice(prompt);
-            try full_line.appendSlice(self.current_line.items);
-            try self.lines.append(full_line);
+            // インタラクティブプログラムの判定
+            const command = self.getFirstCommand();
+            const is_interactive = self.isInteractiveCommand(command);
+
+            if (!is_interactive) {
+                // 非インタラクティブコマンドの場合のみ、現在の行（プロンプト付き）を履歴に追加
+                var full_line = ArrayList(u8).init(self.allocator);
+                const prompt = try self.getPromptForHistory();
+                defer self.allocator.free(prompt);
+                try full_line.appendSlice(prompt);
+                try full_line.appendSlice(self.current_line.items);
+                try self.lines.append(full_line);
+            }
 
             // コマンドの実行
             const result = try self.shell.execute(self.current_line.items);
@@ -160,6 +166,11 @@ pub const Terminal = struct {
                     line.deinit();
                 }
                 self.lines.clearRetainingCapacity();
+                self.allocator.free(result);
+            } else if (is_interactive) {
+                // インタラクティブプログラムの場合は、画面を完全にクリアして再描画
+                _ = c.clear();
+                _ = c.refresh();
                 self.allocator.free(result);
             } else {
                 // 結果の表示
@@ -190,6 +201,27 @@ pub const Terminal = struct {
 
         // スクロール処理
         try self.handleScroll();
+    }
+
+    // コマンドラインから最初のコマンドを抽出
+    fn getFirstCommand(self: *Terminal) []const u8 {
+        if (self.current_line.items.len == 0) return "";
+
+        var it = std.mem.tokenizeAny(u8, self.current_line.items, " \t");
+        return it.next() orelse "";
+    }
+
+    // インタラクティブコマンドかどうかを判定
+    fn isInteractiveCommand(self: *Terminal, command: []const u8) bool {
+        _ = self; // suppress unused parameter warning
+        const interactive_programs = [_][]const u8{ "vim", "nvim", "nano", "emacs", "less", "more", "man", "top", "htop", "vi", "edit", "pico", "joe", "micro", "helix", "tmux", "screen", "bash", "zsh", "fish", "sh", "csh", "tcsh", "ksh", "dash" };
+
+        for (interactive_programs) |prog| {
+            if (std.mem.eql(u8, command, prog)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn handleArrowKey(self: *Terminal, direction: ArrowDirection) !void {
