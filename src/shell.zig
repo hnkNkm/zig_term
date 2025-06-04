@@ -2,6 +2,9 @@ const std = @import("std");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const ChildProcess = std.process.Child;
+const c = @cImport({
+    @cInclude("ncurses.h");
+});
 
 pub const Shell = struct {
     allocator: Allocator,
@@ -10,7 +13,7 @@ pub const Shell = struct {
 
     pub fn init(allocator: Allocator) !Shell {
         const env = try std.process.getEnvMap(allocator);
-        
+
         var cwd = ArrayList(u8).init(allocator);
         const current_dir = std.fs.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
             error.FileNotFound => try allocator.dupe(u8, "/"),
@@ -77,6 +80,19 @@ pub const Shell = struct {
         return try self.executeExternal(args.items);
     }
 
+    // インタラクティブなプログラムかどうかを判定
+    fn isInteractiveProgram(self: *Shell, command: []const u8) bool {
+        _ = self; // suppress unused parameter warning
+        const interactive_programs = [_][]const u8{ "vim", "nvim", "nano", "emacs", "less", "more", "man", "top", "htop", "vi", "edit", "pico", "joe", "micro", "helix", "tmux", "screen", "bash", "zsh", "fish", "sh", "csh", "tcsh", "ksh", "dash" };
+
+        for (interactive_programs) |prog| {
+            if (std.mem.eql(u8, command, prog)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn handleCd(self: *Shell, args: []const []const u8) ![]const u8 {
         const target_dir = if (args.len > 1) args[1] else {
             // HOMEディレクトリに移動
@@ -93,7 +109,7 @@ pub const Shell = struct {
         // パスの正規化
         var target_path: []const u8 = undefined;
         var should_free_target_path = false;
-        
+
         if (target_dir[0] == '/') {
             // 絶対パス
             target_path = target_dir;
@@ -101,13 +117,13 @@ pub const Shell = struct {
             // 相対パス - 現在のディレクトリから解決
             var new_path = ArrayList(u8).init(self.allocator);
             defer new_path.deinit();
-            
+
             try new_path.appendSlice(self.cwd.items);
             if (self.cwd.items[self.cwd.items.len - 1] != '/') {
                 try new_path.append('/');
             }
             try new_path.appendSlice(target_dir);
-            
+
             target_path = try self.allocator.dupe(u8, new_path.items);
             should_free_target_path = true;
         }
@@ -123,7 +139,7 @@ pub const Shell = struct {
         const stat = std.fs.cwd().statFile(real_path) catch {
             return try std.fmt.allocPrint(self.allocator, "cd: {s}: Permission denied", .{target_dir});
         };
-        
+
         if (stat.kind != .directory) {
             return try std.fmt.allocPrint(self.allocator, "cd: {s}: Not a directory", .{target_dir});
         }
@@ -157,11 +173,11 @@ pub const Shell = struct {
 
     fn handleLs(self: *Shell, args: []const []const u8) ![]const u8 {
         const target_dir = if (args.len > 1) args[1] else ".";
-        
+
         // パスの解決
         var full_path: []const u8 = undefined;
         var should_free_path = false;
-        
+
         if (target_dir[0] == '/') {
             // 絶対パス
             full_path = target_dir;
@@ -172,18 +188,18 @@ pub const Shell = struct {
             // 相対パス - 現在のディレクトリから解決
             var path_buf = ArrayList(u8).init(self.allocator);
             defer path_buf.deinit();
-            
+
             try path_buf.appendSlice(self.cwd.items);
             if (self.cwd.items[self.cwd.items.len - 1] != '/') {
                 try path_buf.append('/');
             }
             try path_buf.appendSlice(target_dir);
-            
+
             full_path = try self.allocator.dupe(u8, path_buf.items);
             should_free_path = true;
         }
         defer if (should_free_path) self.allocator.free(full_path);
-        
+
         var dir = std.fs.openDirAbsolute(full_path, .{ .iterate = true }) catch {
             return try std.fmt.allocPrint(self.allocator, "ls: {s}: No such file or directory", .{target_dir});
         };
@@ -224,6 +240,10 @@ pub const Shell = struct {
             \\  help        - Show this help
             \\  exit        - Exit terminal
             \\
+            \\External commands:
+            \\  Any system command, including interactive programs like:
+            \\  vim, nano, emacs, less, man, top, htop, etc.
+            \\
             \\Key bindings:
             \\  Ctrl+C, Ctrl+D, ESC - Exit
             \\  Up/Down arrows - Command history
@@ -235,12 +255,58 @@ pub const Shell = struct {
     }
 
     fn executeExternal(self: *Shell, args: []const []const u8) ![]const u8 {
+        const command = args[0];
+        const is_interactive = self.isInteractiveProgram(command);
+
+        if (is_interactive) {
+            // インタラクティブなプログラムの場合
+            return try self.executeInteractiveProgram(args);
+        } else {
+            // 通常のプログラムの場合
+            return try self.executeNormalProgram(args);
+        }
+    }
+
+    fn executeInteractiveProgram(self: *Shell, args: []const []const u8) ![]const u8 {
+        // ncursesを一時停止
+        _ = c.def_prog_mode(); // 現在のターミナル設定を保存
+        _ = c.endwin(); // ncursesを終了
+
         var process = ChildProcess.init(args, self.allocator);
-        
+
         // shell内部の現在のディレクトリを作業ディレクトリとして設定
         process.cwd_dir = std.fs.openDirAbsolute(self.cwd.items, .{}) catch null;
         defer if (process.cwd_dir) |*dir| dir.close();
-        
+
+        // インタラクティブプログラムはstdin/stdout/stderrを直接使用
+        process.stdin_behavior = .Inherit;
+        process.stdout_behavior = .Inherit;
+        process.stderr_behavior = .Inherit;
+
+        const spawn_result = process.spawn();
+        if (spawn_result) |_| {
+            _ = process.wait() catch {};
+        } else |_| {
+            // ncursesを再開
+            _ = c.reset_prog_mode(); // 保存された設定を復元
+            _ = c.refresh(); // 画面を更新
+            return try std.fmt.allocPrint(self.allocator, "{s}: command not found", .{args[0]});
+        }
+
+        // ncursesを再開
+        _ = c.reset_prog_mode(); // 保存された設定を復元
+        _ = c.refresh(); // 画面を更新
+
+        return try self.allocator.dupe(u8, "");
+    }
+
+    fn executeNormalProgram(self: *Shell, args: []const []const u8) ![]const u8 {
+        var process = ChildProcess.init(args, self.allocator);
+
+        // shell内部の現在のディレクトリを作業ディレクトリとして設定
+        process.cwd_dir = std.fs.openDirAbsolute(self.cwd.items, .{}) catch null;
+        defer if (process.cwd_dir) |*dir| dir.close();
+
         process.stdout_behavior = .Pipe;
         process.stderr_behavior = .Pipe;
 
@@ -250,7 +316,7 @@ pub const Shell = struct {
 
         const stdout = process.stdout.?.reader().readAllAlloc(self.allocator, 1024 * 1024) catch "";
         const stderr = process.stderr.?.reader().readAllAlloc(self.allocator, 1024 * 1024) catch "";
-        
+
         const term = process.wait() catch {
             return try std.fmt.allocPrint(self.allocator, "{s}: failed to execute process", .{args[0]});
         };
@@ -282,4 +348,4 @@ pub const Shell = struct {
 
         return try self.allocator.dupe(u8, result.items);
     }
-}; 
+};
