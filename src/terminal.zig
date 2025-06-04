@@ -152,9 +152,9 @@ pub const Terminal = struct {
             if (suggestions.suggestions.items.len == 0) return;
 
             // 補完候補のヘッダー
-            _ = c.mvprintw(start_y, 0, "補完候補:");
+            _ = c.mvprintw(start_y, 0, "Completions:");
             _ = c.attron(c.A_BOLD);
-            _ = c.mvprintw(start_y + 1, 0, "─────────────────────────────────────");
+            _ = c.mvprintw(start_y + 1, 0, "---------------------------------------");
             _ = c.attroff(c.A_BOLD);
 
             const max_suggestions = @min(suggestions.suggestions.items.len, 6); // 最大6つの候補を表示
@@ -183,7 +183,7 @@ pub const Terminal = struct {
             // 補完候補の操作説明
             const help_y = start_y + 2 + @as(i32, @intCast(max_suggestions)) + 1;
             _ = c.attron(c.A_DIM);
-            _ = c.mvprintw(help_y, 0, "TAB: 次の候補  Enter: 確定  ESC: キャンセル");
+            _ = c.mvprintw(help_y, 0, "TAB: next  Enter: select  ESC: cancel");
             _ = c.attroff(c.A_DIM);
         }
     }
@@ -378,10 +378,12 @@ pub const Terminal = struct {
     }
 
     /// ESCキーで補完候補を隠す
-    pub fn handleEscape(self: *Terminal) void {
+    pub fn handleEscape(self: *Terminal) bool {
         if (self.showing_completions) {
             self.hideCompletions();
+            return true; // 補完候補が表示されていた
         }
+        return false; // 補完候補は表示されていなかった
     }
 
     fn handleScroll(self: *Terminal) !void {
