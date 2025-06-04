@@ -7,6 +7,9 @@ const c = @cImport({
 
 const shell_mod = @import("shell.zig");
 const Shell = shell_mod.Shell;
+const completion_mod = @import("completion.zig");
+const Completer = completion_mod.Completer;
+const CompletionResult = completion_mod.CompletionResult;
 
 pub const ArrowDirection = enum {
     up,
@@ -26,6 +29,11 @@ pub const Terminal = struct {
     command_history: ArrayList(ArrayList(u8)),
     history_index: usize,
     shell: Shell,
+    completer: Completer,
+    // 補完表示状態
+    showing_completions: bool,
+    completion_suggestions: ?CompletionResult,
+    completion_selected_index: usize,
 
     pub fn init(allocator: Allocator) !Terminal {
         var terminal = Terminal{
@@ -39,6 +47,10 @@ pub const Terminal = struct {
             .command_history = ArrayList(ArrayList(u8)).init(allocator),
             .history_index = 0,
             .shell = try Shell.init(allocator),
+            .completer = Completer.init(allocator),
+            .showing_completions = false,
+            .completion_suggestions = null,
+            .completion_selected_index = 0,
         };
 
         // ターミナルサイズの取得
@@ -61,6 +73,11 @@ pub const Terminal = struct {
         self.command_history.deinit();
 
         self.shell.deinit();
+        self.completer.deinit();
+
+        if (self.completion_suggestions) |*suggestions| {
+            suggestions.deinit();
+        }
     }
 
     pub fn draw(self: *Terminal) !void {
@@ -72,16 +89,17 @@ pub const Terminal = struct {
         self.width = c.COLS;
 
         var y: i32 = 0;
+        const max_content_lines = if (self.showing_completions) self.height - 8 else self.height - 2;
 
         // 過去の行を描画
         for (self.lines.items) |line| {
-            if (y >= self.height) break;
+            if (y >= max_content_lines) break;
             _ = c.mvprintw(y, 0, "%.*s", @as(c_int, @intCast(line.items.len)), line.items.ptr);
             y += 1;
         }
 
         // 現在の行を描画（プロンプト付き）
-        if (y < self.height) {
+        if (y < max_content_lines) {
             const prompt = try self.getPrompt();
             defer self.allocator.free(prompt);
 
@@ -115,18 +133,77 @@ pub const Terminal = struct {
 
             // カーソル位置の設定（マーカーを除いた実際の表示文字数に基づく）
             _ = c.move(y, @as(c_int, @intCast(visible_prompt_len)) + self.cursor_x);
+
+            y += 1;
+        }
+
+        // 補完候補を表示
+        if (self.showing_completions) {
+            try self.drawCompletions(y);
         }
 
         // 画面の更新
         _ = c.refresh();
     }
 
+    /// 補完候補の描画
+    fn drawCompletions(self: *Terminal, start_y: i32) !void {
+        if (self.completion_suggestions) |*suggestions| {
+            if (suggestions.suggestions.items.len == 0) return;
+
+            // 補完候補のヘッダー
+            _ = c.mvprintw(start_y, 0, "補完候補:");
+            _ = c.attron(c.A_BOLD);
+            _ = c.mvprintw(start_y + 1, 0, "─────────────────────────────────────");
+            _ = c.attroff(c.A_BOLD);
+
+            const max_suggestions = @min(suggestions.suggestions.items.len, 6); // 最大6つの候補を表示
+            const start_index = if (self.completion_selected_index >= 6)
+                self.completion_selected_index - 5
+            else
+                0;
+
+            for (0..max_suggestions) |i| {
+                const suggestion_index = start_index + i;
+                if (suggestion_index >= suggestions.suggestions.items.len) break;
+
+                const suggestion = suggestions.suggestions.items[suggestion_index];
+                const display_y = start_y + 2 + @as(i32, @intCast(i));
+
+                if (suggestion_index == self.completion_selected_index) {
+                    // 選択された候補をハイライト
+                    _ = c.attron(c.A_REVERSE);
+                    _ = c.mvprintw(display_y, 0, " %.*s", @as(c_int, @intCast(suggestion.len)), suggestion.ptr);
+                    _ = c.attroff(c.A_REVERSE);
+                } else {
+                    _ = c.mvprintw(display_y, 0, " %.*s", @as(c_int, @intCast(suggestion.len)), suggestion.ptr);
+                }
+            }
+
+            // 補完候補の操作説明
+            const help_y = start_y + 2 + @as(i32, @intCast(max_suggestions)) + 1;
+            _ = c.attron(c.A_DIM);
+            _ = c.mvprintw(help_y, 0, "TAB: 次の候補  Enter: 確定  ESC: キャンセル");
+            _ = c.attroff(c.A_DIM);
+        }
+    }
+
     pub fn handleChar(self: *Terminal, char: u8) !void {
+        // 補完候補が表示されている場合は隠す
+        if (self.showing_completions) {
+            self.hideCompletions();
+        }
+
         try self.current_line.insert(@intCast(self.cursor_x), char);
         self.cursor_x += 1;
     }
 
     pub fn handleBackspace(self: *Terminal) !void {
+        // 補完候補が表示されている場合は隠す
+        if (self.showing_completions) {
+            self.hideCompletions();
+        }
+
         if (self.cursor_x > 0) {
             _ = self.current_line.orderedRemove(@intCast(self.cursor_x - 1));
             self.cursor_x -= 1;
@@ -134,6 +211,13 @@ pub const Terminal = struct {
     }
 
     pub fn handleEnter(self: *Terminal) !void {
+        // 補完候補が表示されている場合、選択された候補を適用
+        if (self.showing_completions) {
+            try self.applySelectedCompletion();
+            return;
+        }
+
+        // 既存のEnter処理
         // コマンドの実行
         if (self.current_line.items.len > 0) {
             // コマンド履歴に追加
@@ -227,35 +311,76 @@ pub const Terminal = struct {
     pub fn handleArrowKey(self: *Terminal, direction: ArrowDirection) !void {
         switch (direction) {
             .left => {
+                // 補完候補が表示されている場合は隠す
+                if (self.showing_completions) {
+                    self.hideCompletions();
+                }
+
                 if (self.cursor_x > 0) {
                     self.cursor_x -= 1;
                 }
             },
             .right => {
+                // 補完候補が表示されている場合は隠す
+                if (self.showing_completions) {
+                    self.hideCompletions();
+                }
+
                 if (self.cursor_x < self.current_line.items.len) {
                     self.cursor_x += 1;
                 }
             },
             .up => {
-                if (self.history_index > 0) {
-                    self.history_index -= 1;
-                    const cmd = self.command_history.items[self.history_index];
-                    self.current_line.clearRetainingCapacity();
-                    try self.current_line.appendSlice(cmd.items);
-                    self.cursor_x = @intCast(self.current_line.items.len);
+                if (self.showing_completions) {
+                    // 補完候補が表示されている場合、前の候補を選択
+                    if (self.completion_suggestions) |*suggestions| {
+                        if (suggestions.suggestions.items.len > 0) {
+                            if (self.completion_selected_index == 0) {
+                                self.completion_selected_index = suggestions.suggestions.items.len - 1;
+                            } else {
+                                self.completion_selected_index -= 1;
+                            }
+                        }
+                    }
+                } else {
+                    // 通常のコマンド履歴
+                    if (self.history_index > 0) {
+                        self.history_index -= 1;
+                        const cmd = self.command_history.items[self.history_index];
+                        self.current_line.clearRetainingCapacity();
+                        try self.current_line.appendSlice(cmd.items);
+                        self.cursor_x = @intCast(self.current_line.items.len);
+                    }
                 }
             },
             .down => {
-                if (self.history_index < self.command_history.items.len) {
-                    self.history_index += 1;
-                    self.current_line.clearRetainingCapacity();
-                    if (self.history_index < self.command_history.items.len) {
-                        const cmd = self.command_history.items[self.history_index];
-                        try self.current_line.appendSlice(cmd.items);
+                if (self.showing_completions) {
+                    // 補完候補が表示されている場合、次の候補を選択
+                    if (self.completion_suggestions) |*suggestions| {
+                        if (suggestions.suggestions.items.len > 0) {
+                            self.completion_selected_index = (self.completion_selected_index + 1) % suggestions.suggestions.items.len;
+                        }
                     }
-                    self.cursor_x = @intCast(self.current_line.items.len);
+                } else {
+                    // 通常のコマンド履歴
+                    if (self.history_index < self.command_history.items.len) {
+                        self.history_index += 1;
+                        self.current_line.clearRetainingCapacity();
+                        if (self.history_index < self.command_history.items.len) {
+                            const cmd = self.command_history.items[self.history_index];
+                            try self.current_line.appendSlice(cmd.items);
+                        }
+                        self.cursor_x = @intCast(self.current_line.items.len);
+                    }
                 }
             },
+        }
+    }
+
+    /// ESCキーで補完候補を隠す
+    pub fn handleEscape(self: *Terminal) void {
+        if (self.showing_completions) {
+            self.hideCompletions();
         }
     }
 
@@ -467,6 +592,142 @@ pub const Terminal = struct {
             return try std.fmt.allocPrint(self.allocator, "{s} ({s}) $ ", .{ path_part, branch_name });
         } else {
             return try std.fmt.allocPrint(self.allocator, "{s} $ ", .{path_part});
+        }
+    }
+
+    /// TAB補完の処理
+    pub fn handleTab(self: *Terminal) !void {
+        if (self.showing_completions) {
+            // 既に補完候補が表示されている場合、次の候補を選択
+            try self.selectNextCompletion();
+        } else {
+            // 新しい補完を開始
+            try self.startCompletion();
+        }
+    }
+
+    /// 補完処理の開始
+    fn startCompletion(self: *Terminal) !void {
+        // 既存の補完結果をクリア
+        if (self.completion_suggestions) |*suggestions| {
+            suggestions.deinit();
+            self.completion_suggestions = null;
+        }
+
+        // 補完候補を取得
+        var result = try self.completer.complete(
+            self.current_line.items,
+            @intCast(self.cursor_x),
+            self.shell.cwd.items,
+        );
+
+        if (result.suggestions.items.len == 0) {
+            // 候補がない場合
+            result.deinit();
+            return;
+        }
+
+        if (result.suggestions.items.len == 1) {
+            // 候補が1つの場合、直接補完
+            try self.applyCompletion(result.suggestions.items[0]);
+            result.deinit();
+        } else {
+            // 複数の候補がある場合
+            if (result.common_prefix.len > 0) {
+                // 共通プレフィックスがある場合、それを適用
+                try self.applyCommonPrefix(&result);
+            }
+
+            // 補完候補を表示
+            self.completion_suggestions = result;
+            self.showing_completions = true;
+            self.completion_selected_index = 0;
+        }
+    }
+
+    /// 次の補完候補を選択
+    fn selectNextCompletion(self: *Terminal) !void {
+        if (self.completion_suggestions) |*suggestions| {
+            if (suggestions.suggestions.items.len > 0) {
+                self.completion_selected_index = (self.completion_selected_index + 1) % suggestions.suggestions.items.len;
+            }
+        }
+    }
+
+    /// 補完を適用
+    fn applyCompletion(self: *Terminal, completion: []const u8) !void {
+        // 現在のカーソル位置から単語の開始位置を見つける
+        const word_start = self.findCurrentWordStart();
+
+        // 現在の単語を削除
+        while (self.cursor_x > word_start) {
+            _ = self.current_line.orderedRemove(@intCast(self.cursor_x - 1));
+            self.cursor_x -= 1;
+        }
+
+        // 補完文字列を挿入
+        for (completion) |char| {
+            try self.current_line.insert(@intCast(self.cursor_x), char);
+            self.cursor_x += 1;
+        }
+
+        // 補完状態をリセット
+        self.hideCompletions();
+    }
+
+    /// 共通プレフィックスを適用
+    fn applyCommonPrefix(self: *Terminal, result: *CompletionResult) !void {
+        if (result.common_prefix.len == 0) return;
+
+        // 現在の単語の開始位置を見つける
+        const word_start = self.findCurrentWordStart();
+        const current_word_len = @as(usize, @intCast(self.cursor_x - word_start));
+
+        // 共通プレフィックスが現在の単語より長い場合のみ適用
+        if (result.common_prefix.len > current_word_len) {
+            const additional_chars = result.common_prefix[current_word_len..];
+
+            for (additional_chars) |char| {
+                try self.current_line.insert(@intCast(self.cursor_x), char);
+                self.cursor_x += 1;
+            }
+        }
+    }
+
+    /// 現在の単語の開始位置を見つける
+    fn findCurrentWordStart(self: *Terminal) i32 {
+        var pos = self.cursor_x;
+
+        while (pos > 0) {
+            const char = self.current_line.items[@intCast(pos - 1)];
+            if (char == ' ' or char == '\t') {
+                break;
+            }
+            pos -= 1;
+        }
+
+        return pos;
+    }
+
+    /// 補完候補の表示を隠す
+    fn hideCompletions(self: *Terminal) void {
+        self.showing_completions = false;
+        if (self.completion_suggestions) |*suggestions| {
+            suggestions.deinit();
+            self.completion_suggestions = null;
+        }
+        self.completion_selected_index = 0;
+    }
+
+    /// Enterキーで選択された補完を適用
+    pub fn applySelectedCompletion(self: *Terminal) !void {
+        if (self.showing_completions) {
+            if (self.completion_suggestions) |*suggestions| {
+                if (self.completion_selected_index < suggestions.suggestions.items.len) {
+                    const selected = suggestions.suggestions.items[self.completion_selected_index];
+                    try self.applyCompletion(selected);
+                }
+            }
         }
     }
 };

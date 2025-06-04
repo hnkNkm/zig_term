@@ -66,12 +66,20 @@ fn runMainLoop(terminal: *Terminal) !void {
             3 => running = false,
             // Ctrl+D で終了
             4 => running = false,
-            // ESC で終了
-            27 => running = false,
+            // ESC で終了または補完候補を隠す
+            27 => {
+                terminal.handleEscape();
+                // 補完候補が表示されていなかった場合は終了
+                if (!terminal.showing_completions) {
+                    running = false;
+                }
+            },
             // Enter
             10, 13 => try terminal.handleEnter(),
             // Backspace
             8, 127, c.KEY_BACKSPACE => try terminal.handleBackspace(),
+            // TAB
+            9 => try terminal.handleTab(),
             // 矢印キー
             c.KEY_UP => try terminal.handleArrowKey(.up),
             c.KEY_DOWN => try terminal.handleArrowKey(.down),
