@@ -39,6 +39,12 @@ pub const Shell = struct {
             return "";
         }
 
+        // パイプの検出
+        const pipe_count = std.mem.count(u8, command_line, "|");
+        if (pipe_count > 0) {
+            return try self.executePipedCommands(command_line);
+        }
+
         // コマンドラインの解析
         var args = ArrayList([]const u8).init(self.allocator);
         defer {
@@ -78,6 +84,51 @@ pub const Shell = struct {
 
         // 外部コマンドの実行
         return try self.executeExternal(args.items);
+    }
+
+    fn executePipedCommands(self: *Shell, command_line: []const u8) ![]const u8 {
+        // シンプルなパイプ実装: シェルを使用して実行
+        var shell_cmd = ArrayList([]const u8).init(self.allocator);
+        defer shell_cmd.deinit();
+        
+        try shell_cmd.append("/bin/sh");
+        try shell_cmd.append("-c");
+        try shell_cmd.append(command_line);
+        
+        var process = ChildProcess.init(shell_cmd.items, self.allocator);
+        process.cwd_dir = std.fs.openDirAbsolute(self.cwd.items, .{}) catch null;
+        defer if (process.cwd_dir) |*dir| dir.close();
+        
+        process.stdin_behavior = .Ignore;
+        process.stdout_behavior = .Pipe;
+        process.stderr_behavior = .Pipe;
+        
+        process.spawn() catch {
+            return try std.fmt.allocPrint(self.allocator, "Failed to execute piped command", .{});
+        };
+        
+        const stdout = process.stdout.?.reader().readAllAlloc(self.allocator, 1024 * 1024) catch "";
+        const stderr = process.stderr.?.reader().readAllAlloc(self.allocator, 1024 * 1024) catch "";
+        defer self.allocator.free(stderr);
+        
+        _ = process.wait() catch {};
+        
+        // 結果を結合
+        if (stderr.len > 0 and stdout.len == 0) {
+            return stderr;
+        } else if (stderr.len > 0) {
+            var result = ArrayList(u8).init(self.allocator);
+            defer result.deinit();
+            try result.appendSlice(stdout);
+            if (stdout.len > 0 and stdout[stdout.len - 1] != '\n') {
+                try result.append('\n');
+            }
+            try result.appendSlice(stderr);
+            self.allocator.free(stdout);
+            return try self.allocator.dupe(u8, result.items);
+        } else {
+            return stdout;
+        }
     }
 
     // インタラクティブなプログラムかどうかを判定
@@ -240,6 +291,9 @@ pub const Shell = struct {
             \\  help        - Show this help
             \\  exit        - Exit terminal
             \\
+            \\Shell features:
+            \\  command1 | command2 - Pipe output from command1 to command2
+            \\
             \\External commands:
             \\  Any system command, including interactive programs like:
             \\  vim, nano, emacs, less, man, top, htop, etc.
@@ -249,6 +303,7 @@ pub const Shell = struct {
             \\  Up/Down arrows - Command history
             \\  Left/Right arrows - Cursor movement
             \\  Backspace - Delete character
+            \\  Tab - Command/path completion
             \\
         ;
         return try self.allocator.dupe(u8, help_text);
